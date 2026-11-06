@@ -11,8 +11,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  catalog-check:
+    name: Catalog matches generator output
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.x'
+
+      # The committed catalog must be exactly what the generator produces
+      # from the bundled scripts, so a hand-edited or stale tweaks.json
+      # (including its upstream provenance fields) blocks the release.
+      - name: Regenerate catalog and compare
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/regen/scripts"
+          python3 tools/catalog_gen.py \
+            src/UltimateWinUI/Assets/Scripts \
+            "$RUNNER_TEMP/regen/scripts" \
+            "$RUNNER_TEMP/regen/tweaks.json"
+          if ! cmp -s "$RUNNER_TEMP/regen/tweaks.json" src/UltimateWinUI/Assets/tweaks.json; then
+            echo "::error::src/UltimateWinUI/Assets/tweaks.json does not match a regeneration from Assets/Scripts. Re-run tools/catalog_gen.py and commit the result."
+            diff <(python3 -m json.tool src/UltimateWinUI/Assets/tweaks.json) \
+                 <(python3 -m json.tool "$RUNNER_TEMP/regen/tweaks.json") | head -n 100 || true
+            exit 1
+          fi
+
   build-installer:
     name: Build ${{ matrix.arch }} installer
+    needs: catalog-check
     runs-on: windows-latest
     permissions:
       contents: read
@@ -32,16 +65,18 @@ jobs:
             install_mode: arm64
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up .NET 8
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: 8.0.x
 
+      # Pinned so a compromised or changed package cannot silently alter
+      # the installer toolchain between releases.
       - name: Install Inno Setup 6
         shell: pwsh
-        run: choco install innosetup --yes --no-progress
+        run: choco install innosetup --version=6.2.1 --yes --no-progress
 
       - name: Publish and create installer
         shell: pwsh
@@ -82,11 +117,27 @@ jobs:
             installer/UltimateWinUI.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # The digest is computed in the same job that built the installer,
+      # so the publish job can prove the bytes it releases are the bytes
+      # that were built.
+      - name: Record installer SHA256
+        shell: pwsh
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          $installerDir = Join-Path $env:GITHUB_WORKSPACE "artifacts/installers"
+          Get-ChildItem $installerDir -Filter '*.exe' | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)" | Out-File -FilePath (Join-Path $installerDir "SHA256SUMS-$env:ARCH.txt") -Encoding ascii -Append
+          }
+
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.arch }}-installer
-          path: artifacts/installers/*.exe
+          path: |
+            artifacts/installers/*.exe
+            artifacts/installers/SHA256SUMS-*.txt
           if-no-files-found: error
           retention-days: 7
 
@@ -94,16 +145,19 @@ jobs:
     name: Publish GitHub release
     needs: build-installer
     runs-on: ubuntu-latest
+    # Releases require a human approval in the "release" environment
+    # before anything is published.
+    environment: release
     permissions:
       contents: write
     steps:
       - name: Check out source history
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
       - name: Download installers
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: '*-installer'
           path: artifacts
@@ -125,6 +179,25 @@ jobs:
             exit 1
           fi
 
+          # Refuse to publish anything whose bytes do not match the
+          # digest recorded by the build job that produced it.
+          : > artifacts/SHA256SUMS.txt
+          for manifest in artifacts/SHA256SUMS-x64.txt artifacts/SHA256SUMS-arm64.txt; do
+            if [[ ! -f "$manifest" ]]; then
+              printf 'Missing build digest manifest %s; refusing to publish.\n' "$manifest" >&2
+              exit 1
+            fi
+            cat "$manifest" >> artifacts/SHA256SUMS.txt
+          done
+          while read -r expected_hash file_name; do
+            actual_hash=$(sha256sum "artifacts/$file_name" | awk '{print $1}')
+            if [[ "$actual_hash" != "$expected_hash" ]]; then
+              printf 'SHA256 mismatch for %s (manifest %s, actual %s); refusing to publish.\n' \
+                "$file_name" "$expected_hash" "$actual_hash" >&2
+              exit 1
+            fi
+          done < artifacts/SHA256SUMS.txt
+
           if previous_tag=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" --match 'v[0-9]*' 2>/dev/null); then
             commit_range="${previous_tag}..${GITHUB_REF_NAME}"
             compare_url="https://github.com/${GITHUB_REPOSITORY}/compare/${previous_tag}...${GITHUB_REF_NAME}"
@@ -141,10 +214,23 @@ jobs:
           {
             printf '# UltimateWinUI %s\n\n' "$GITHUB_REF_NAME"
             printf '## Changes\n\n%s\n\n' "$changes"
+            printf '## SHA256 checksums\n\n```\n'
+            cat artifacts/SHA256SUMS.txt
+            printf '```\n\n'
             printf '**Full Changelog:** %s\n' "$compare_url"
           } > release-notes.md
 
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Never overwrite assets on an existing release: a published
+            # installer must stay byte-identical so its published digest
+            # keeps meaning something. Re-running against an asset-less
+            # release (e.g. a failed first attempt) only fills it in.
+            existing_assets=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')
+            if [[ "$existing_assets" != "0" ]]; then
+              printf 'Release %s already has %s asset(s); refusing to overwrite published assets. Delete the release manually if a re-release is intended.\n' \
+                "$GITHUB_REF_NAME" "$existing_assets" >&2
+              exit 1
+            fi
             gh release edit "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --title "UltimateWinUI $GITHUB_REF_NAME" \
@@ -152,12 +238,13 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" \
               "artifacts/$expected_x64" \
               "artifacts/$expected_arm64" \
-              --repo "$GITHUB_REPOSITORY" \
-              --clobber
+              "artifacts/SHA256SUMS.txt" \
+              --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$GITHUB_REF_NAME" \
               "artifacts/$expected_x64" \
               "artifacts/$expected_arm64" \
+              "artifacts/SHA256SUMS.txt" \
               --repo "$GITHUB_REPOSITORY" \
               --title "UltimateWinUI $GITHUB_REF_NAME" \
               --notes-file release-notes.md
