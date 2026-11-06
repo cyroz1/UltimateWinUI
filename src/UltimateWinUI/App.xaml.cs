@@ -60,10 +60,15 @@ public partial class App : Application
     {
         var highRiskConfirmation = tweak.Risk == "high" && Settings.ConfirmAdvanced && option.Kind == "apply";
         var scriptConfirmation = !string.IsNullOrWhiteSpace(option.ConfirmationMessage);
-        if (highRiskConfirmation || scriptConfirmation)
+        // Defense in depth: an Advanced apply with no catalog confirmation
+        // still gets a review dialog even when the settings gate is off,
+        // so no combination of settings and catalog data can reduce an
+        // Advanced change to zero prompts.
+        var advancedWithoutConfirmation = tweak.Risk == "high" && option.Kind == "apply" && !scriptConfirmation;
+        if (highRiskConfirmation || scriptConfirmation || advancedWithoutConfirmation)
         {
             var content = new StackPanel { Spacing = 8 };
-            if (highRiskConfirmation)
+            if (highRiskConfirmation || advancedWithoutConfirmation)
             {
                 content.Children.Add(new TextBlock
                 {
@@ -93,7 +98,7 @@ public partial class App : Application
 
             var dialog = new ContentDialog
             {
-                Title = highRiskConfirmation ? "Review before running" : "Script instructions",
+                Title = highRiskConfirmation || advancedWithoutConfirmation ? "Review before running" : "Script instructions",
                 Content = content,
                 PrimaryButtonText = "Run",
                 CloseButtonText = "Cancel",

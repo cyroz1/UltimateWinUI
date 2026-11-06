@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Security.AccessControl;
+using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Threading.Tasks;
 using UltimateWinUI.Models;
 
@@ -11,10 +14,14 @@ namespace UltimateWinUI.Services;
 /// Runs tweak options without ever showing a console:
 ///
 ///   apply/check options -> the option's script body (extracted verbatim from
-///     the upstream script by the catalog generator) is written to a temp .ps1
-///     and run with Windows PowerShell, hidden, output piped to the log view.
-///     The app itself runs elevated (see app.manifest), so children inherit
-///     admin rights and the scripts never relaunch into a visible console.
+///     the upstream script by the catalog generator) is staged in a fresh
+///     per-run directory under an ACL-restricted work dir and run with
+///     Windows PowerShell, hidden, output piped to the log view. The staged
+///     file is held open read-shared while PowerShell runs, so its contents
+///     cannot be swapped between staging and execution, and the staged
+///     SHA256 is written to the log. The app itself runs elevated (see
+///     app.manifest), so children inherit admin rights and the scripts
+///     never relaunch into a visible console.
 ///
 ///   launch options -> opened through the shell (ms-settings pages, control
 ///     panel applets, websites, other apps).
@@ -29,6 +36,7 @@ public sealed class Runner
         _log = log;
         _workDir = Path.Combine(CatalogService.DataDir, "work");
         Directory.CreateDirectory(_workDir);
+        HardenWorkDir();
     }
 
     public async Task<int> RunOptionAsync(Tweak tweak, TweakOption option, IReadOnlyList<string>? inputs = null)
@@ -40,22 +48,38 @@ public sealed class Runner
             return 0;
         }
 
-        var fileName = $"{Sanitize(tweak.Id)}-{Sanitize(option.Label)}.ps1";
-        var path = Path.Combine(_workDir, fileName);
-        var isArm64 = System.Runtime.InteropServices.RuntimeInformation.OSArchitecture ==
-                      System.Runtime.InteropServices.Architecture.Arm64;
-        var body = isArm64 && option.Arm64Body != null ? option.Arm64Body : option.Body;
-        if (isArm64 && option.Arm64Body != null)
-            _log.Write("Using the ARM64 variant of this script (native ARM64 payload).");
-        var script = "$ErrorActionPreference = 'Continue'\n" +
-                     "$ProgressPreference = 'SilentlyContinue'\n" +
-                     body;
-        await File.WriteAllTextAsync(path, script);
+        var runDir = NewRunDir();
+        try
+        {
+            var fileName = $"{Sanitize(tweak.Id)}-{Sanitize(option.Label)}.ps1";
+            var path = Path.Combine(runDir, fileName);
+            var isArm64 = System.Runtime.InteropServices.RuntimeInformation.OSArchitecture ==
+                          System.Runtime.InteropServices.Architecture.Arm64;
+            var body = isArm64 && option.Arm64Body != null ? option.Arm64Body : option.Body;
+            if (isArm64 && option.Arm64Body != null)
+                _log.Write("Using the ARM64 variant of this script (native ARM64 payload).");
+            var script = "$ErrorActionPreference = 'Continue'\n" +
+                         "$ProgressPreference = 'SilentlyContinue'\n" +
+                         body;
+            await File.WriteAllTextAsync(path, script);
 
-        _log.Write($"--- {tweak.Name} -> {option.Label} ---");
-        var exit = await RunPowerShellHiddenAsync(path, inputs);
-        _log.Write($"--- {tweak.Name} finished (exit {exit}) ---");
-        return exit;
+            _log.Write($"--- {tweak.Name} -> {option.Label} ---");
+
+            // Hold the staged file open with FileShare.Read until
+            // PowerShell exits: its contents cannot be swapped between
+            // the write above and execution, and the logged hash is the
+            // hash of the bytes that ran.
+            var bytes = await File.ReadAllBytesAsync(path);
+            _log.Write($"Staged script SHA256: {Convert.ToHexString(SHA256.HashData(bytes))}");
+            await using var hold = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var exit = await RunPowerShellHiddenAsync(path, inputs);
+            _log.Write($"--- {tweak.Name} finished (exit {exit}) ---");
+            return exit;
+        }
+        finally
+        {
+            DeleteRunDir(runDir);
+        }
     }
 
     public void Launch(TweakOption option)
@@ -78,21 +102,79 @@ public sealed class Runner
     public async Task CreateRestorePointAsync()
     {
         _log.Write("Creating restore point (UltimateWinUI)...");
-        var path = Path.Combine(_workDir, "restore-point.ps1");
-        await File.WriteAllTextAsync(path,
-            "Enable-ComputerRestore -Drive 'C:\\' -ErrorAction SilentlyContinue\n" +
-            "Checkpoint-Computer -Description 'UltimateWinUI' -RestorePointType 'MODIFY_SETTINGS'\n");
-        var exit = await RunPowerShellHiddenAsync(path);
-        _log.Write(exit == 0
-            ? "Restore point created."
-            : $"Restore point failed (exit {exit}). Continuing anyway; see log output above.");
+        var runDir = NewRunDir();
+        try
+        {
+            var path = Path.Combine(runDir, "restore-point.ps1");
+            await File.WriteAllTextAsync(path,
+                "Enable-ComputerRestore -Drive 'C:\\' -ErrorAction SilentlyContinue\n" +
+                "Checkpoint-Computer -Description 'UltimateWinUI' -RestorePointType 'MODIFY_SETTINGS'\n");
+            await using var hold = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var exit = await RunPowerShellHiddenAsync(path);
+            _log.Write(exit == 0
+                ? "Restore point created."
+                : $"Restore point failed (exit {exit}). Continuing anyway; see log output above.");
+        }
+        finally
+        {
+            DeleteRunDir(runDir);
+        }
     }
 
     private async Task RunInlineAsync(string body)
     {
-        var path = Path.Combine(_workDir, $"inline-{Guid.NewGuid():N}.ps1");
-        await File.WriteAllTextAsync(path, body);
-        await RunPowerShellHiddenAsync(path);
+        var runDir = NewRunDir();
+        try
+        {
+            var path = Path.Combine(runDir, $"inline-{Guid.NewGuid():N}.ps1");
+            await File.WriteAllTextAsync(path, body);
+            await using var hold = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            await RunPowerShellHiddenAsync(path);
+        }
+        finally
+        {
+            DeleteRunDir(runDir);
+        }
+    }
+
+    private string NewRunDir()
+    {
+        var dir = Path.Combine(_workDir, $"run-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    private static void DeleteRunDir(string dir)
+    {
+        try { Directory.Delete(dir, recursive: true); } catch { }
+    }
+
+    private void HardenWorkDir()
+    {
+        // The work dir holds scripts that run elevated. Restrict it to
+        // SYSTEM and Administrators so another local user, or a
+        // medium-integrity process of the same user, cannot pre-plant or
+        // replace a staged script. Best effort: the app always runs as
+        // administrator, but if the ACL change fails the per-run
+        // randomized directory names still apply.
+        try
+        {
+            var security = new DirectorySecurity();
+            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            var rights = FileSystemRights.FullControl;
+            var inheritance = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+            security.AddAccessRule(new FileSystemAccessRule(
+                new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+                rights, inheritance, PropagationFlags.None, AccessControlType.Allow));
+            security.AddAccessRule(new FileSystemAccessRule(
+                new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+                rights, inheritance, PropagationFlags.None, AccessControlType.Allow));
+            Directory.SetAccessControl(_workDir, security);
+        }
+        catch (Exception ex)
+        {
+            _log.Write("Could not restrict the work directory ACL: " + ex.Message);
+        }
     }
 
     private async Task<int> RunPowerShellHiddenAsync(string scriptPath, IReadOnlyList<string>? inputs = null)

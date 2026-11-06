@@ -47,32 +47,75 @@ public sealed class AppSettings
 
     private static string FilePath => Path.Combine(CatalogService.DataDir, "settings.json");
 
+    // The consent-critical flags (ConfirmAdvanced,
+    // CreateRestorePointBeforeApply) are stored separately, next to the
+    // installed executable, where only administrators can write (the app
+    // always runs elevated). settings.json lives in the per-user data
+    // directory, where any process running as the user could flip
+    // ConfirmAdvanced off and silently remove the Advanced review
+    // dialog; values found there are therefore never honored for these
+    // two flags.
+    private static string ConsentPath => Path.Combine(AppContext.BaseDirectory, "consent.json");
+
+    public sealed class ConsentFile
+    {
+        public bool ConfirmAdvanced { get; set; } = true;
+        public bool CreateRestorePointBeforeApply { get; set; }
+    }
+
     public static AppSettings Load()
     {
+        AppSettings settings;
         try
         {
-            if (File.Exists(FilePath))
+            settings = File.Exists(FilePath)
+                ? JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath)) ?? new AppSettings()
+                : new AppSettings { SettingsVersion = 2 };
+        }
+        catch { settings = new AppSettings { SettingsVersion = 2 }; }
+
+        // Fail closed: the two consent flags start from their safe
+        // defaults and are then taken from consent.json only.
+        settings.ConfirmAdvanced = true;
+        settings.CreateRestorePointBeforeApply = false;
+        try
+        {
+            if (File.Exists(ConsentPath))
             {
-                var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath)) ?? new AppSettings();
-                if (!settings.SettingsVersion.HasValue || settings.SettingsVersion.Value < 2)
+                var consent = JsonSerializer.Deserialize<ConsentFile>(File.ReadAllText(ConsentPath));
+                if (consent != null)
                 {
-                    // Version 1 defaulted restore points on for every apply.
-                    // Migrate that implicit default to off; users can opt in again.
-                    settings.CreateRestorePointBeforeApply = false;
-                    settings.SettingsVersion = 2;
-                    settings.Save();
+                    settings.ConfirmAdvanced = consent.ConfirmAdvanced;
+                    settings.CreateRestorePointBeforeApply = consent.CreateRestorePointBeforeApply;
                 }
-                return settings;
             }
         }
-        catch { /* fall through to defaults */ }
-        return new AppSettings { SettingsVersion = 2 };
+        catch { /* keep the safe defaults */ }
+
+        if (!settings.SettingsVersion.HasValue || settings.SettingsVersion.Value < 2)
+        {
+            // Version 1 defaulted restore points on for every apply.
+            // Migrate that implicit default to off; users can opt in again.
+            settings.CreateRestorePointBeforeApply = false;
+            settings.SettingsVersion = 2;
+            settings.Save();
+        }
+        return settings;
     }
 
     public void Save()
     {
         try { File.WriteAllText(FilePath, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true })); }
         catch { /* non-fatal */ }
+        try
+        {
+            File.WriteAllText(ConsentPath, JsonSerializer.Serialize(new ConsentFile
+            {
+                ConfirmAdvanced = ConfirmAdvanced,
+                CreateRestorePointBeforeApply = CreateRestorePointBeforeApply,
+            }, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { /* non-fatal; Load fails closed without a readable consent file */ }
     }
 }
 
