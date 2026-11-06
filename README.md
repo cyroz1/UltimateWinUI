@@ -31,6 +31,9 @@ Windows optimization script library, styled after the Windows Settings app
 - **Safety settings:** a confirmation dialog before running anything from the
   Advanced category (on by default), plus an optional restore point before
   each apply (off by default). Both settings can be changed in Settings.
+  Independently of those settings, every Advanced option also carries its
+  own confirmation prompt in the catalog, so an Advanced change is never
+  applied with no dialog at all.
 
 ## How it works
 
@@ -83,6 +86,18 @@ the self-contained x64 and ARM64 Inno Setup installers, then creates and
 publishes a GitHub release with a commit-based changelog and both installers
 attached. The workflow can also be dispatched manually for a tag. The first
 release uses the `v1.0.0` tag.
+
+Release hardening: every action is pinned to a full commit SHA and the
+Inno Setup install is pinned to a fixed version. Each build job records
+a SHA256 digest of its installer; the publish job verifies the bytes
+against those digests, attaches `SHA256SUMS.txt` to the release and
+prints the checksums in the release notes, refuses to overwrite assets
+on an existing release, and requires approval in the `release` GitHub
+environment before publishing. A `catalog-check` job regenerates the
+catalog from `Assets/Scripts` and blocks the release if the committed
+`tweaks.json` differs. The installers are not code-signed (no
+certificate is configured for this repo), so the published digests are
+the integrity check users have.
 
 ## Layout
 
