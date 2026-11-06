@@ -436,9 +436,17 @@ def main() -> int:
         digest.update(b"\0")
     upstream_commit = None
     try:
-        upstream_commit = subprocess.run(
-            ["git", "-C", str(src), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=10).stdout.strip() or None
+        # Only trust a git HEAD when the input checkout actually is the
+        # upstream repo; otherwise (e.g. regenerating from this repo's own
+        # bundled Assets/Scripts in CI) the HEAD would name the wrong
+        # project and make regeneration non-reproducible.
+        remote = subprocess.run(
+            ["git", "-C", str(src), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+        if "fr33thyfr33thy/ultimate" in remote.lower():
+            upstream_commit = subprocess.run(
+                ["git", "-C", str(src), "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=10).stdout.strip() or None
     except Exception:
         upstream_commit = None
 
