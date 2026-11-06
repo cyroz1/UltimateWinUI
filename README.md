@@ -49,8 +49,18 @@ To refresh the catalog from a newer upstream release:
 
 ```powershell
 git clone https://github.com/FR33THYFR33THY/Ultimate ..\Ultimate
+git -C ..\Ultimate checkout <commit-or-tag-you-are-shipping>
 python tools\catalog_gen.py ..\Ultimate src\UltimateWinUI\Assets\Scripts src\UltimateWinUI\Assets\tweaks.json
 ```
+
+The generator records the upstream commit and a SHA256 digest of the
+input script tree in `tweaks.json` (`upstream` field), and CI fails the
+release build if the committed catalog does not match a regeneration
+from the bundled `Assets/Scripts`, so the shipped catalog always
+corresponds to a known upstream state. The generator also applies the
+security transforms in `tools/hardening.py` to the emitted bodies
+(private staging directories, verified vendor downloads, confirmation
+prompts for every Advanced option); the bundled scripts stay pristine.
 
 ## Build
 

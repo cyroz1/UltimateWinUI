@@ -20,15 +20,23 @@ them against each option's signature to work out which state the tweak is in.
 Usage:
     python3 catalog_gen.py <ultimate-repo-dir> <scripts-out-dir> <json-out>
 """
+import hashlib
 import json
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from descriptions import DESCRIPTIONS
 from arch import ARM64_BODIES, ARM64_BODY_SWAPS
+from hardening import (
+    ADVANCED_CONFIRMATION,
+    CONFIRMATION_OVERRIDES,
+    GENERATOR_VERSION,
+    apply_hardening,
+)
 
 
 def arm64_variant(script_path: str, body: str):
@@ -297,6 +305,7 @@ def main() -> int:
     categories = []
     total = 0
     stats = {"dropdown": 0, "button": 0, "actions": 0}
+    hardening_stats: dict = {}
 
     for folder in sorted(p for p in src.iterdir() if p.is_dir() and p.name in CATEGORY_META):
         cat_name, cat_desc = CATEGORY_META[folder.name]
@@ -369,6 +378,24 @@ def main() -> int:
                     variant = arm64_variant(script_path, opt["body"])
                     if variant:
                         opt["arm64Body"] = variant
+            # Security hardening (tools/hardening.py): private staging for
+            # download/extract/execute chains and verified downloads for
+            # direct-from-vendor payloads. Applied after the ARM64 variant
+            # is derived so the arch swaps keep matching the original text;
+            # ARM64 variant bodies are not hardened yet.
+            for opt in options:
+                if opt.get("body"):
+                    opt["body"] = apply_hardening(script_path, opt["body"], hardening_stats)
+            # No Advanced apply may ship without a confirmation: if the
+            # settings-file gate is ever disabled (or tampered with), these
+            # options still prompt. Options that already carry a console
+            # derived confirmation keep it.
+            if cat_name == "Advanced":
+                for opt in options:
+                    if opt["kind"] == "apply" and not opt.get("confirmation"):
+                        opt["confirmation"] = CONFIRMATION_OVERRIDES.get(
+                            (script_path, opt["label"]),
+                            ADVANCED_CONFIRMATION.format(label=opt["label"]))
             recommended = next((o["label"] for o in options
                                 if "recommended" in o["label"].lower()), None)
             tweak = {
@@ -395,10 +422,32 @@ def main() -> int:
         categories.append({"name": cat_name, "folder": folder.name,
                              "description": cat_desc, "tweaks": tweaks})
 
+    # Provenance: bind the emitted catalog to the exact upstream input it
+    # was generated from, so a reviewer (and the CI regen check) can tell
+    # whether the committed catalog corresponds to a known upstream state.
+    # The tree digest covers every consumed script, so it works for any
+    # input directory; the commit is recorded when the input is a git
+    # checkout (the documented refresh flow clones upstream).
+    digest = hashlib.sha256()
+    for ps1 in sorted(src.rglob("*.ps1")):
+        digest.update(ps1.relative_to(src).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(ps1.read_bytes())
+        digest.update(b"\0")
+    upstream_commit = None
+    try:
+        upstream_commit = subprocess.run(
+            ["git", "-C", str(src), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10).stdout.strip() or None
+    except Exception:
+        upstream_commit = None
+
     doc = {
         "library": "FR33THY Ultimate",
         "source": "https://github.com/FR33THYFR33THY/Ultimate",
         "license": "MIT (c) FR33THY",
+        "generator": {"tool": "tools/catalog_gen.py", "version": GENERATOR_VERSION},
+        "upstream": {"commit": upstream_commit, "treeSha256": digest.hexdigest()},
         "categories": categories,
     }
     missing = [f"{c['folder']}/{t['script'].split('/')[-1]}"
@@ -408,6 +457,8 @@ def main() -> int:
     json_out.parent.mkdir(parents=True, exist_ok=True)
     json_out.write_text(json.dumps(doc, indent=1, ensure_ascii=False), encoding="utf-8")
     print(f"tweaks: {total}  controls: {stats}")
+    print(f"hardening: {hardening_stats}")
+    print(f"upstream: commit={upstream_commit} treeSha256={digest.hexdigest()}")
     print(f"json: {json_out} ({json_out.stat().st_size/1024:.0f} KB)")
     return 0
 
